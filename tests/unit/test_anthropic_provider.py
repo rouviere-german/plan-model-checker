@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -527,3 +529,42 @@ def test_client_timeout_defaults_to_the_sdk_default_of_ten_minutes() -> None:
     assert Settings(_env_file=None).llm_timeout_seconds == 600.0
     client = AnthropicProvider(api_key=SecretStr("test-key-not-real"))._get_client()
     assert client.timeout == 600.0
+
+
+def test_offline_modules_do_not_import_the_sdk() -> None:
+    code = (
+        "import sys\n"
+        "import plan_model_checker.agentic.providers.anthropic\n"
+        "import plan_model_checker.checker, plan_model_checker.planner\n"
+        "import plan_model_checker.engine, plan_model_checker.api, plan_model_checker.demo\n"
+        "print('anthropic' in sys.modules)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=120
+    )
+    assert result.stdout.strip() == "False"
+
+
+def test_planner_and_repairer_roles_map_to_the_models_the_spec_names() -> None:
+    from plan_model_checker.engine import live_provider
+    from plan_model_checker.planner import PLANNER_ROLE, REPAIRER_ROLE
+
+    settings = Settings(_env_file=None, repairer="anthropic")
+    assert settings.llm_planner_model == "claude-sonnet-5"
+    assert settings.llm_repair_model == "claude-opus-5"
+    provider = live_provider(settings)
+    assert provider.model_for(PLANNER_ROLE) == "claude-sonnet-5"
+    assert provider.model_for(REPAIRER_ROLE) == "claude-opus-5"
+    planner = provider.build_params(
+        LLMRequest(messages=(ChatMessage.user("plan"),), output_schema=SCHEMA, role=PLANNER_ROLE)
+    )
+    repairer = provider.build_params(
+        LLMRequest(messages=(ChatMessage.user("fix"),), output_schema=SCHEMA, role=REPAIRER_ROLE)
+    )
+    assert planner["model"] == "claude-sonnet-5"
+    assert "fallbacks" not in planner  # the default fallback is documented for Opus 5 / Fable 5.x
+    assert repairer["model"] == "claude-opus-5"
+    assert repairer["fallbacks"] == "default"
+    assert repairer["betas"] == ["server-side-fallback-2026-07-01"]
+    assert repairer["thinking"] == {"type": "adaptive"}
+    assert repairer["output_config"]["format"]["type"] == "json_schema"
