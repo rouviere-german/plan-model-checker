@@ -1,0 +1,35 @@
+# Local stack. Only locally built images; nothing is pulled at runtime besides the pinned bases.
+services:
+  app:
+    build:
+      context: .
+    image: plan-model-checker:local
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      APP_ENVIRONMENT: prod
+      APP_LOG_LEVEL: INFO
+      # Comma-separated "<sha256>:<scope>+<scope>" entries; generate with
+      # `uv run plan-model-checker generate-api-key --scopes check+monitor`.
+      APP_API_KEY_SHA256: ${APP_API_KEY_SHA256:-}
+      # A signed registry bundle (mounted read-only), its trusted public key(s) and an optional
+      # pin. Without them the built-in registry is signed with an ephemeral key and /readyz
+      # reports registry_signature=fail in prod.
+      APP_REGISTRY_PATH: ${APP_REGISTRY_PATH:-}
+      APP_REGISTRY_PUBLIC_KEYS: ${APP_REGISTRY_PUBLIC_KEYS:-}
+      APP_REGISTRY_SHA256: ${APP_REGISTRY_SHA256:-}
+      # scripted (offline) or anthropic (needs ANTHROPIC_API_KEY; leave both unset to stay offline).
+      APP_REPAIRER: ${APP_REPAIRER:-scripted}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    read_only: true
+    tmpfs:
+      # Audit log, approval store and budget ledger (APP_DATA_DIR in the image).
+      - /tmp:size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 1.0
+    restart: unless-stopped
