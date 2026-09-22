@@ -31,6 +31,9 @@ Both layers, compiled from the same specs:
   false. After the call it applies the effects the tool reported plus a sensor re-read of every
   fluent a live spec instance depends on, flags a divergence when the observed change is not
   exactly a declared outcome, and stops the run if the observed state already violates a spec.
+  ([ADR 0006](0006-sensor-over-self-reports-and-executor-side-verification.md) tightens this:
+  the sensor's reading wins over the report, a contradicted report stops the run, and tools may
+  only report their declared effects.)
 - Tool implementations are pinned to the hash of the declaration they were written against, so a
   registry that silently changes a tool's declared effects cannot be paired with the old code.
 
@@ -42,6 +45,7 @@ Both layers, compiled from the same specs:
 - Guarantees are stated relative to the declarations ([SOUNDNESS.md](../SOUNDNESS.md)).
 - Specs must name *fluents* when they depend on an effect having happened: an event such as
   `drain[s]` records that the call was made, not that it worked. `drain_before_restart` uses both.
-- The sensor is a trust boundary: the monitor is only as good as what tools report and what can
-  be re-read. Effects that are neither reported nor sensed stay invisible.
+- The sensor is a trust boundary: with a sensor the monitor is as good as what can be re-read;
+  without one it is only as good as what tools report. Effects that are neither reported nor
+  sensed stay invisible.
 - End-of-plan obligations can only be detected at the end, not blocked.
