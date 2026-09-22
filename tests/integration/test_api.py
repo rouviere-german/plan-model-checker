@@ -60,6 +60,24 @@ def client(tmp_path: Path) -> Iterator[TestClient]:
         yield c
 
 
+def big_plan() -> dict[str, Any]:
+    """Eight approved deletions: enough states to exhaust a 100-state budget.
+
+    (Eight bare approval requests no longer do: every spec instance is vacuous on such a plan
+    and the checker proves it safe without searching.)
+    """
+    steps: list[dict[str, Any]] = []
+    for index in range(8):
+        path = f"/d{index}"
+        steps += [
+            call("request_approval", path=path),
+            if_prop(
+                "approved", path, [call("archive_dir", path=path), call("delete_dir", path=path)]
+            ),
+        ]
+    return plan("big", *steps).model_dump(mode="json")
+
+
 def unsafe() -> dict[str, Any]:
     subject = plan(
         "delete logs",
@@ -261,11 +279,7 @@ def test_state_budget_exhaustion_is_reported_not_verified(tmp_path: Path) -> Non
     app = create_service_app(settings(tmp_path, check_max_states=100))
     with TestClient(app) as client:
         response = client.post("/v1/check", json={"plan": unsafe()}, headers=headers("checker"))
-        big = plan(
-            "big",
-            *[call("request_approval", path=f"/d{i}") for i in range(8)],
-        ).model_dump(mode="json")
-        budget = client.post("/v1/check", json={"plan": big}, headers=headers("checker"))
+        budget = client.post("/v1/check", json={"plan": big_plan()}, headers=headers("checker"))
     assert response.status_code == 200
     assert budget.status_code == 422
     assert budget.json()["error"]["code"] == "check_budget_exceeded"
@@ -399,12 +413,11 @@ def test_monitor_requests_are_budgeted_and_never_a_500(tmp_path: Path) -> None:
 
 def test_override_requests_report_check_budget_exhaustion_as_422(tmp_path: Path) -> None:
     app = create_service_app(settings(tmp_path, check_max_states=100))
-    big = plan("big", *[call("request_approval", path=f"/d{i}") for i in range(8)])
     with TestClient(app) as client:
         response = client.post(
             "/v1/overrides",
             json={
-                "plan": big.model_dump(mode="json"),
+                "plan": big_plan(),
                 "justification": "a long enough justification for the test",
             },
             headers=headers("agent"),

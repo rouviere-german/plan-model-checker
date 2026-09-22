@@ -11,6 +11,9 @@ generated specs (every past-time operator under a top-level G). For every case a
 checker's verdict must equal the oracle's, which enumerates every trace and evaluates the textbook
 semantics directly. For every counterexample, replaying it through the plan must give a trace the
 oracle says violates the spec, and its length must equal the oracle's shortest violation.
+The run also counts the spec instances the checker skipped as vacuous (they fold to true once
+events no call emits and fluents no call changes are replaced by constants), so the oracle
+comparison covers that shortcut too.
 """
 
 from __future__ import annotations
@@ -41,6 +44,8 @@ def run(cases: int, seed: int) -> dict[str, object]:
     spec_checks = 0
     violated_checks = 0
     counterexamples = 0
+    instances = 0
+    skipped = 0
     traces = 0
     checker_seconds = 0.0
     oracle_seconds = 0.0
@@ -54,6 +59,8 @@ def run(cases: int, seed: int) -> dict[str, object]:
         started = time.perf_counter()
         result = ModelChecker(registry, specs).check(subject)
         checker_seconds += time.perf_counter() - started
+        instances += result.instances_checked
+        skipped += result.instances_skipped
         started = time.perf_counter()
         expected = oracle_check(subject, registry, specs)
         oracle_seconds += time.perf_counter() - started
@@ -87,6 +94,8 @@ def run(cases: int, seed: int) -> dict[str, object]:
         "counterexamples": counterexamples,
         "replay_failures": replay_failures,
         "shortest_length_mismatches": length_mismatches,
+        "instances": instances,
+        "instances_skipped_as_vacuous": skipped,
         "oracle_traces_enumerated": traces,
         "max_unrolled_calls": max_calls,
         "checker_seconds": round(checker_seconds, 2),
@@ -119,6 +128,10 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"counterexamples: {summary['counterexamples']}; replay failures: "
         f"{summary['replay_failures']}; not shortest: {summary['shortest_length_mismatches']}"
+    )
+    print(
+        f"spec instances: {summary['instances']}, skipped as vacuous: "
+        f"{summary['instances_skipped_as_vacuous']} (verdicts above include them)"
     )
     print(
         f"oracle enumerated {summary['oracle_traces_enumerated']} traces "

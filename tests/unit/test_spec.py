@@ -266,3 +266,56 @@ def test_new_instances_are_exactly_the_bindings_that_use_an_added_resource(
     fresh = [i.key for i in specs.new_instances(universe, added)]
     assert len(fresh) == len(set(fresh)), "each new binding is produced once"
     assert set(fresh) == after - before
+
+
+@given(st.randoms(use_true_random=False))
+def test_folding_fixed_propositions_preserves_the_value_at_every_position(
+    rng: random.Random,
+) -> None:
+    """simplify() is exact: on traces where the fixed props keep their value, nothing changes."""
+    from plan_model_checker.spec.ast import Bool
+    from plan_model_checker.spec.simplify import simplify
+
+    formula: Formula = random_formula(rng, depth=5, variables=())
+    props = sorted(compile_monitor(formula).props) or [GroundProp("a", ("r1",))]
+    fixed = {prop: rng.random() < 0.5 for prop in props if rng.random() < 0.6}
+    folded = simplify(formula, fixed.get)
+    trace = [
+        {prop for prop in props if fixed.get(prop, rng.random() < 0.5)}
+        for _ in range(rng.randint(1, 6))
+    ]
+    original, reduced = Evaluator(trace), Evaluator(trace)
+    for position in range(len(trace)):
+        assert original.holds(formula, position) == reduced.holds(folded, position)
+    if len(fixed) == len(props):
+        # Everything fixed: only Y/Z at position 0 can keep a formula from folding completely.
+        assert isinstance(folded, Bool) or "Y" in render(folded) or "Z" in render(folded)
+
+
+def test_vacuous_instances_are_skipped_without_changing_the_verdict(
+    registry: EffectRegistry,
+) -> None:
+    from plan_model_checker.catalog import protocol_specs
+    from plan_model_checker.checker import ModelChecker
+    from plan_model_checker.corpus import call, if_prop, plan
+
+    subject = plan(
+        "delete one directory",
+        call("request_approval", path="/a"),
+        if_prop(
+            "approved",
+            "/a",
+            [
+                call("archive_dir", path="/a"),
+                call("snapshot_dir", path="/a"),
+                call("delete_dir", path="/a"),
+            ],
+        ),
+    )
+    result = ModelChecker(registry, protocol_specs(registry)).check(subject)
+    assert result.ok
+    assert result.instances_checked == 6
+    # release_all_locks, mutate_under_lock and no_double_acquire cannot fail: no call touches
+    # the lock and nothing is compacted.
+    assert result.instances_skipped == 3
+    assert result.to_json()["instances_skipped"] == 3

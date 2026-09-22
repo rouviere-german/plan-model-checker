@@ -11,7 +11,11 @@ Pipeline for one plan:
 3. **Control-flow graph.** Loops are unrolled, loop variables substituted, and branches become
    edges: guarded edges for ``If`` on a tracked proposition, unguarded choice edges for opaque
    predicates. Tool calls are action edges; each declared outcome is a separate transition.
-4. **Spec instances.** Specs are grounded over the resources the plan mentions.
+4. **Spec instances.** Specs are grounded over the resources the plan mentions. An instance that
+   holds on every trace for syntactic reasons is skipped: events no call in the graph emits are
+   false everywhere and fluents no call can change keep their initial value, and if folding
+   those constants into the instance (:mod:`~plan_model_checker.spec.simplify`) gives ``true``
+   no search is needed (``G(delete[r] -> ...)`` for an ``r`` that is never deleted).
 5. **Search.** For each instance, a 0-1 breadth-first search over states ``(control point,
    relevant fluents, monitor state)``: choice edges cost 0, actions cost 1, so the first violating
    terminal state popped is a shortest violating trace. States are memoized, so paths that
@@ -29,7 +33,7 @@ from __future__ import annotations
 import itertools
 import time
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -49,6 +53,7 @@ from plan_model_checker.ir import (
 )
 from plan_model_checker.props import END, START, GroundProp
 from plan_model_checker.spec.monitor import CompiledMonitor, compile_monitor
+from plan_model_checker.spec.simplify import TRUE, simplify
 from plan_model_checker.spec.specs import InstanceBudgetExceededError, SpecInstance, SpecSet
 
 __all__ = [
@@ -66,6 +71,7 @@ __all__ = [
     "Violation",
     "build_cfg",
     "collection_bounds",
+    "fixed_props",
     "size_assignments",
 ]
 
@@ -207,6 +213,7 @@ class CheckResult:
     size_assignments: int
     plan_sha256: str
     seconds: float
+    instances_skipped: int = 0
 
     @property
     def ok(self) -> bool:
@@ -224,6 +231,7 @@ class CheckResult:
             "plan_sha256": self.plan_sha256,
             "states_explored": self.states_explored,
             "instances_checked": self.instances_checked,
+            "instances_skipped": self.instances_skipped,
             "size_assignments": self.size_assignments,
             "violations": [violation.to_json() for violation in self.violations],
         }
@@ -376,6 +384,31 @@ def build_cfg(
     plan: Plan, registry: EffectRegistry, sizes: tuple[tuple[str, int], ...] = ()
 ) -> ControlFlowGraph:
     return _CfgBuilder(registry, dict(sizes)).build(plan, sizes)
+
+
+def fixed_props(
+    cfg: ControlFlowGraph, registry: EffectRegistry
+) -> Callable[[GroundProp], bool | None]:
+    """Propositions with one value at every position of every trace of ``cfg`` (else None).
+
+    An event that no call in the graph emits is always false; a fluent that no declared outcome
+    of any call can set keeps its initial value.
+    """
+    events = {START, END}
+    changeable: set[GroundProp] = set()
+    for edges in cfg.edges:
+        for edge in edges:
+            if edge.call is not None:
+                args = edge.call.arg_map()
+                events.add(registry.ground_event(edge.call.tool, args))
+                changeable |= registry.declared_updates(edge.call.tool, args)
+
+    def fixed(prop: GroundProp) -> bool | None:
+        if registry.prop(prop.name).kind == "event":
+            return None if prop in events else False
+        return None if prop in changeable else registry.initial(prop)
+
+    return fixed
 
 
 # --- search -----------------------------------------------------------------------------------
@@ -586,11 +619,18 @@ class ModelChecker:
     """Check plans against a spec set, relative to a (verified) effect registry."""
 
     def __init__(
-        self, registry: EffectRegistry, specs: SpecSet, limits: CheckLimits | None = None
+        self,
+        registry: EffectRegistry,
+        specs: SpecSet,
+        limits: CheckLimits | None = None,
+        *,
+        skip_vacuous: bool = True,
     ) -> None:
+        """``skip_vacuous=False`` searches every instance (the benchmark measures the gain)."""
         self.registry = registry
         self.specs = specs
         self.limits = limits or CheckLimits()
+        self.skip_vacuous = skip_vacuous
         self._monitors: dict[object, CompiledMonitor] = {}
 
     def _monitor(self, instance: SpecInstance) -> CompiledMonitor:
@@ -617,6 +657,7 @@ class ModelChecker:
         violated_instances: dict[str, set[str]] = {}
         explored = 0
         instances_checked = 0
+        instances_skipped = 0
         for sizes in assignments:
             cfg = build_cfg(plan, self.registry, sizes)
             remaining = self.limits.max_instances - instances_checked
@@ -627,7 +668,11 @@ class ModelChecker:
             instances_checked += len(instances)
             if instances_checked > self.limits.max_instances:
                 raise CheckBudgetExceededError("instances", self.limits.max_instances)
+            fixed = fixed_props(cfg, self.registry)
             for instance in instances:
+                if self.skip_vacuous and simplify(instance.final, fixed) == TRUE:
+                    instances_skipped += 1  # holds on every trace of this graph
+                    continue
                 search = _InstanceSearch(cfg, self.registry, instance, self._monitor(instance))
                 counterexample, count = search.search(budget)
                 explored += count
@@ -654,6 +699,7 @@ class ModelChecker:
             size_assignments=len(assignments),
             plan_sha256=plan_sha256(plan),
             seconds=time.perf_counter() - started,
+            instances_skipped=instances_skipped,
         )
 
 
