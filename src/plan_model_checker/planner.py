@@ -5,11 +5,17 @@ and ``repairer`` revises a rejected plan given the checker's counterexamples (cl
 live). Both answer in the flat wire format through structured output, and both are charged to one
 :class:`~plan_model_checker.agentic.budget.BudgetLedger` (steps, tokens and USD).
 
-Prompt hygiene: the task is operator text; specs and tool declarations come from the server's own
-compiled copies; everything a model or a tool produced (the rejected plan, counterexamples that
-quote it, runtime tool outputs) goes into untrusted-data envelopes. Nothing in a prompt or a
-response can change the specs or the registry: the only thing read back is a plan, which is
-validated against a closed schema and then checked again.
+Prompt hygiene: specs and tool declarations come from the server's own compiled copies; the task
+and everything a model or a tool produced (the rejected plan, counterexamples that quote it,
+runtime tool outputs) go into untrusted-data envelopes, so a task that embeds a forged
+repair-context envelope is quoted, not parsed. Nothing in a prompt or a response can change the
+specs or the registry: the only thing read back is a plan, which is validated against a closed
+schema and then checked again.
+
+A repair may add steps and wrap existing ones in branches or loops, but it must keep every call
+of the original plan, with the same arguments and in the same relative order
+(:func:`missing_calls`). Otherwise dropping the risky step would count as a successful repair:
+a plan that does nothing is safe. Candidates that drop steps are rejected as ``dropped_steps``.
 
 Offline, :class:`ScriptedPlannerPolicy` replays plans from the corpus and
 :class:`ScriptedRepairPolicy` applies the first repair hint of the first violation, i.e. inserts
@@ -32,6 +38,7 @@ from plan_model_checker.agentic.envelope import (
     UNTRUSTED_DATA_POLICY,
     UntrustedData,
     parse_envelopes,
+    wrap_user_content,
 )
 from plan_model_checker.agentic.errors import BudgetExceededError, ProviderError
 from plan_model_checker.agentic.providers.base import (
@@ -45,7 +52,14 @@ from plan_model_checker.checker import CheckBudgetExceededError, CheckResult, Mo
 from plan_model_checker.core.canonical import canonical_json
 from plan_model_checker.effects import EffectRegistry
 from plan_model_checker.explain import RepairHint, explain
-from plan_model_checker.ir import Plan, PlanError, ToolCall, insert_node, plan_sha256
+from plan_model_checker.ir import (
+    Plan,
+    PlanError,
+    ToolCall,
+    insert_node,
+    iter_calls,
+    plan_sha256,
+)
 from plan_model_checker.spec.specs import SpecSet
 from plan_model_checker.wire import plan_to_wire, wire_schema, wire_to_plan
 
@@ -61,6 +75,7 @@ __all__ = [
     "ScriptedRepairPolicy",
     "catalogue_text",
     "hints_for",
+    "missing_calls",
 ]
 
 PLANNER_ROLE = "planner"
@@ -191,14 +206,46 @@ class RepairOutcome:
     def repaired(self) -> bool:
         return self.status == "verified" and not self.initial.ok
 
+    @property
+    def dropped_step_rejections(self) -> int:
+        return sum(attempt.verdict == "dropped_steps" for attempt in self.attempts)
+
     def to_json(self) -> dict[str, Any]:
         return {
             "status": self.status,
             "plan": self.plan.model_dump(mode="json"),
             "initial_violations": list(self.initial.violated_specs()),
+            "dropped_step_rejections": self.dropped_step_rejections,
             "result": self.result.to_json(),
             "attempts": [attempt.to_json() for attempt in self.attempts],
         }
+
+
+def _call_label(node: ToolCall) -> str:
+    args = ", ".join(f"{arg.name}={arg.value}" for arg in sorted(node.args, key=lambda a: a.name))
+    return f"{node.tool}({args})"
+
+
+def missing_calls(original: Plan, candidate: Plan) -> list[str]:
+    """Calls of ``original`` that ``candidate`` drops, as labels (empty if it keeps them all).
+
+    Both plans are read as their call sites in source order (loops not unrolled). Every call of
+    the original must appear in the candidate with the same tool and arguments, in the same
+    relative order; the candidate may add calls anywhere and move calls into new branches or
+    loops. This cannot prove that the repair still does the task (a call can be wrapped in a
+    branch that is never taken), but it rejects the cheapest way to fake one: deleting the step
+    the counterexample is about.
+    """
+    labels = [_call_label(node) for _, node in iter_calls(candidate.steps)]
+    position = 0
+    missing: list[str] = []
+    for _, node in iter_calls(original.steps):
+        label = _call_label(node)
+        try:
+            position = labels.index(label, position) + 1
+        except ValueError:
+            missing.append(label)
+    return missing
 
 
 def hints_for(plan: Plan, registry: EffectRegistry, result: CheckResult) -> list[RepairHint | None]:
@@ -251,12 +298,15 @@ class RepairLoop:
         system = (
             "You repair plans that a model checker rejected. Each counterexample is a shortest "
             "execution of the plan that breaks a rule; the hint names the step that is missing "
-            "and where it goes. Return the whole corrected plan. Do not drop steps the task "
-            f"needs.\n\n{catalogue_text(registry, self.checker.specs)}\n\n{_PLAN_FORMAT}\n\n"
+            "and where it goes. Return the whole corrected plan. Keep every call of the plan you "
+            "were given, with the same arguments and in the same order: add the missing steps, "
+            "and wrap calls in branches where needed. A plan that drops a call is rejected. The "
+            "task is quoted in the user:task element.\n\n"
+            f"{catalogue_text(registry, self.checker.specs)}\n\n{_PLAN_FORMAT}\n\n"
             f"{UNTRUSTED_DATA_POLICY}"
         )
         blocks = [
-            TextBlock(text=f"Task: {task}"),
+            TextBlock(text=wrap_user_content("task", task).render()),
             TextBlock(text=repair_context(plan, registry, result).render()),
         ]
         blocks.extend(TextBlock(text=item.render()) for item in observations)
@@ -283,6 +333,22 @@ class RepairLoop:
             },
         )
         return result
+
+    def _reject_dropped(
+        self, outcome: RepairOutcome, attempt: int, candidate: Plan, dropped: list[str]
+    ) -> None:
+        digest = plan_sha256(candidate)
+        error = f"dropped {len(dropped)} call(s) of the original plan: " + ", ".join(dropped[:5])
+        outcome.attempts.append(RepairAttempt(attempt, digest, "dropped_steps", (), error[:300]))
+        self._log(
+            "repair.rejected",
+            {
+                "attempt": attempt,
+                "plan_sha256": digest,
+                "reason": "dropped_steps",
+                "dropped": [*dropped[:20]],
+            },
+        )
 
     def run(
         self, task: str, plan: Plan, *, observations: Sequence[UntrustedData] = ()
@@ -313,6 +379,16 @@ class RepairLoop:
                 continue
             try:
                 candidate = _response_plan(response)
+            except PlanError as exc:
+                outcome.attempts.append(
+                    RepairAttempt(attempt, None, "rejected", (), str(exc)[:200])
+                )
+                continue
+            dropped = missing_calls(plan, candidate)
+            if dropped:
+                self._reject_dropped(outcome, attempt, candidate, dropped)
+                continue
+            try:
                 result = self._check(candidate)
             except (PlanError, CheckBudgetExceededError) as exc:
                 outcome.attempts.append(
@@ -385,12 +461,17 @@ class ScriptedRepairPolicy:
 
 
 def _find_context(request: LLMRequest) -> dict[str, Any]:
-    for block in request.messages[-1].content:
-        if not isinstance(block, TextBlock):
-            continue
-        for envelope in parse_envelopes(block.text):
-            if envelope.source == REPAIR_CONTEXT_SOURCE:
-                data = json.loads(envelope.content)
-                if isinstance(data, dict):
-                    return data
-    raise ValueError("repair request has no repair context")
+    """The one repair-context envelope of the request; none or several is an error."""
+    found = [
+        envelope
+        for block in request.messages[-1].content
+        if isinstance(block, TextBlock)
+        for envelope in parse_envelopes(block.text)
+        if envelope.source == REPAIR_CONTEXT_SOURCE
+    ]
+    if len(found) != 1:
+        raise ValueError(f"expected exactly one repair context, found {len(found)}")
+    data = json.loads(found[0].content)
+    if not isinstance(data, dict):
+        raise TypeError("the repair context is not a JSON object")
+    return data
