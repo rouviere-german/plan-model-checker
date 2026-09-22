@@ -36,6 +36,13 @@ def test_demo_tells_the_whole_story_offline(tmp_path: Path) -> None:
     assert divergent["status"] == "blocked"
     assert divergent["divergences"] == [f"snapshot_dir(path={DEMO_TARGET})"]
     assert summary["deleted_in_divergent_run"] == []
+    lying = summary["lying_run"]
+    assert isinstance(lying, dict)
+    assert lying["status"] == "aborted"
+    assert lying["misreports"] == [
+        f"snapshot_dir(path={DEMO_TARGET}): backup_ok[{DEMO_TARGET}] reported true, sensed false"
+    ]
+    assert summary["deleted_in_lying_run"] == []
     assert summary["audit_ok"] is True
     assert summary["tampered_audit_detected"] is True
     # Running twice starts from a clean state.

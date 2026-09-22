@@ -7,7 +7,9 @@
 5. The repaired plan runs against mock tools: the directory is backed up, then deleted.
 6. It runs again in a world where the snapshot tool silently fails: the runtime monitor blocks
    the deletion, and nothing is deleted.
-7. The hash-chained audit log verifies; a tampered copy does not.
+7. And again with a snapshot tool that silently fails *and reports success*: the sensor reading
+   contradicts the report, the run stops at the misreport, and nothing is deleted.
+8. The hash-chained audit log verifies; a tampered copy does not.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from plan_model_checker.agentic.providers.fake import FakeProvider
 from plan_model_checker.catalog import PROTOCOL_SPECS, file_maintenance_registry_model
 from plan_model_checker.checker import ModelChecker
 from plan_model_checker.corpus import call, if_prop, plan
-from plan_model_checker.effects import EffectRegistryModel
+from plan_model_checker.effects import EffectRegistry, EffectRegistryModel
 from plan_model_checker.explain import explain
 from plan_model_checker.ir import Plan, iter_calls
 from plan_model_checker.planner import (
@@ -32,7 +34,7 @@ from plan_model_checker.planner import (
     ScriptedPlannerPolicy,
     ScriptedRepairPolicy,
 )
-from plan_model_checker.runtime import PlanExecutor, ToolGateway
+from plan_model_checker.runtime import PlanExecutor, RunResult, ToolGateway
 from plan_model_checker.signing import (
     RegistryIntegrityError,
     generate_signing_key,
@@ -62,6 +64,27 @@ def _unsafe_plan() -> Plan:
 
 def _approve_all(record: ApprovalRecord, store: ApprovalStore) -> None:
     store.decide(record.id, approver="human:ops-oncall", approve=True, reason="demo approval")
+
+
+def _execute(
+    registry: EffectRegistry,
+    specs: SpecSet,
+    audit: AuditLog,
+    subject: Plan,
+    world: FileMaintenanceWorld,
+    *,
+    misreporting: frozenset[str] = frozenset(),
+) -> RunResult:
+    return PlanExecutor(
+        registry,
+        specs,
+        ToolGateway(registry, build_tools(world, registry, misreporting=misreporting)),
+        opaque=world.decide,
+        collections=world.collection,
+        audit=audit,
+        principal=world.agent,
+        sensor=world.sense,
+    ).run(subject)
 
 
 def run_demo(workdir: Path) -> dict[str, JsonValue]:  # noqa: PLR0915 - a linear narrative
@@ -139,35 +162,16 @@ def run_demo(workdir: Path) -> dict[str, JsonValue]:  # noqa: PLR0915 - a linear
 
     # 5. Healthy run: backup, then delete.
     healthy = FileMaintenanceWorld(dirs={DEMO_TARGET: 7}, reviewer=_approve_all)
-    healthy_run = PlanExecutor(
-        registry,
-        specs,
-        ToolGateway(registry, build_tools(healthy, registry)),
-        opaque=healthy.decide,
-        collections=healthy.collection,
-        audit=audit,
-        principal=healthy.agent,
-        sensor=healthy.sense,
-    ).run(repaired)
+    healthy_run = _execute(registry, specs, audit, repaired, healthy)
     story.append(
         f"run (healthy tools): {healthy_run.status}; deleted={sorted(healthy.deleted)}; "
         f"backups={sorted(healthy.backups)}"
     )
 
     # 6. Divergent run: the snapshot silently does nothing; the monitor blocks the delete.
-    broken = FileMaintenanceWorld(
-        dirs={DEMO_TARGET: 7}, reviewer=_approve_all, faults={"snapshot_dir": "noop"}
-    )
-    broken_run = PlanExecutor(
-        registry,
-        specs,
-        ToolGateway(registry, build_tools(broken, registry)),
-        opaque=broken.decide,
-        collections=broken.collection,
-        audit=audit,
-        principal=broken.agent,
-        sensor=broken.sense,
-    ).run(repaired)
+    faults = {"snapshot_dir": "noop"}
+    broken = FileMaintenanceWorld(dirs={DEMO_TARGET: 7}, reviewer=_approve_all, faults=faults)
+    broken_run = _execute(registry, specs, audit, repaired, broken)
     blocked = broken_run.blocked
     story.append(
         f"run (snapshot silently fails): {broken_run.status}; blocked "
@@ -175,7 +179,17 @@ def run_demo(workdir: Path) -> dict[str, JsonValue]:  # noqa: PLR0915 - a linear
         f"deleted={sorted(broken.deleted)}"
     )
 
-    # 7. Audit chain.
+    # 7. Lying run: the snapshot does nothing but reports success; the sensor contradicts it.
+    lying = FileMaintenanceWorld(dirs={DEMO_TARGET: 7}, reviewer=_approve_all, faults=faults)
+    lying_run = _execute(
+        registry, specs, audit, repaired, lying, misreporting=frozenset({"snapshot_dir"})
+    )
+    story.append(
+        f"run (snapshot fails but reports success): {lying_run.status}; "
+        f"misreport: {'; '.join(lying_run.misreports)}; deleted={sorted(lying.deleted)}"
+    )
+
+    # 8. Audit chain.
     verified = verify_file(audit.path, expect_head=audit.head)
     lines = audit.path.read_text(encoding="utf-8").splitlines(keepends=True)
     lines[1] = lines[1].replace('"plan.proposed"', '"plan.approved"', 1)
@@ -201,6 +215,8 @@ def run_demo(workdir: Path) -> dict[str, JsonValue]:  # noqa: PLR0915 - a linear
         "healthy_run": healthy_run.to_json(),
         "divergent_run": broken_run.to_json(),
         "deleted_in_divergent_run": [*sorted(broken.deleted)],
+        "lying_run": lying_run.to_json(),
+        "deleted_in_lying_run": [*sorted(lying.deleted)],
         "audit_ok": verified.ok,
         "audit_entries": verified.entries,
         "audit_head": verified.head,
