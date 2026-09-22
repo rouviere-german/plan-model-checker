@@ -24,7 +24,7 @@ from typing import Any
 from lark import Lark, Token, Transformer, v_args
 from lark.exceptions import LarkError, UnexpectedInput, VisitError
 
-from plan_model_checker.ir import RESOURCE_PATTERN
+from plan_model_checker.ir import is_valid_resource
 from plan_model_checker.spec.ast import (
     Always,
     And,
@@ -111,7 +111,6 @@ COMMENT: /#[^\n]*/
 %ignore COMMENT
 """
 
-_RESOURCE = re.compile(RESOURCE_PATTERN)
 _SPEC_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
@@ -183,7 +182,7 @@ class _ToAst(Transformer[Token, Any]):
 
     def const(self, token: Token) -> Term:
         value = _unquote(token)
-        if not _RESOURCE.fullmatch(value):
+        if not is_valid_resource(value):
             raise SpecSyntaxError(f"constant {value!r} is not a valid resource name")
         return Const(value)
 

@@ -25,7 +25,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
 from plan_model_checker.core.canonical import canonical_json, sha256_hex
 
@@ -33,6 +33,7 @@ __all__ = [
     "IDENT_PATTERN",
     "RESOURCE_PATTERN",
     "TOOL_PATTERN",
+    "ArgValue",
     "ForEach",
     "Guard",
     "If",
@@ -42,10 +43,12 @@ __all__ = [
     "PlanError",
     "PlanLimits",
     "PropGuard",
+    "ResourceValue",
     "ToolArg",
     "ToolCall",
     "check_plan_limits",
     "insert_node",
+    "is_valid_resource",
     "iter_calls",
     "node_at",
     "plan_sha256",
@@ -56,10 +59,34 @@ IDENT_PATTERN = r"^[a-z][a-z0-9_]{0,63}$"
 TOOL_PATTERN = r"^[a-z][a-z0-9_]{0,63}$"
 # Constants may not contain "#" (reserved for symbolic loop resources) or start with "$".
 RESOURCE_PATTERN = r"^[A-Za-z0-9_./:@-][A-Za-z0-9_./:@-]{0,127}$"
+_RESOURCE = re.compile(RESOURCE_PATTERN)
 _VAR_REF = re.compile(r"^\$([a-z][a-z0-9_]{0,31})$")
 _ARG_PATTERN = r"^(\$[a-z][a-z0-9_]{0,31}|[A-Za-z0-9_./:@-][A-Za-z0-9_./:@-]{0,127})$"
+_DOT_SEGMENTS = frozenset({".", ".."})
 
-ArgValue = Annotated[str, Field(pattern=_ARG_PATTERN)]
+
+def is_valid_resource(value: str) -> bool:
+    """A resource constant: the allowed characters, and no ``.`` or ``..`` path segment.
+
+    The checker treats resources as opaque names, so ``/srv/../etc`` and ``/etc`` would be two
+    different resources to it and one directory to a file system. Dot segments are refused
+    everywhere a resource can enter (plans, runtime collections, monitor reports, spec constants)
+    so that this kind of aliasing cannot be expressed. Real tools must still resolve paths
+    against an allowed root; see docs/SOUNDNESS.md.
+    """
+    return bool(_RESOURCE.fullmatch(value)) and not any(
+        segment in _DOT_SEGMENTS for segment in value.split("/")
+    )
+
+
+def _no_dot_segments(value: str) -> str:
+    if not value.startswith("$") and any(segment in _DOT_SEGMENTS for segment in value.split("/")):
+        raise ValueError("resource names may not contain '.' or '..' path segments")
+    return value
+
+
+ArgValue = Annotated[str, Field(pattern=_ARG_PATTERN), AfterValidator(_no_dot_segments)]
+ResourceValue = Annotated[str, Field(pattern=RESOURCE_PATTERN), AfterValidator(_no_dot_segments)]
 
 
 class PlanError(ValueError):
@@ -118,7 +145,7 @@ class If(_Frozen):
 class ForEach(_Frozen):
     kind: Literal["foreach"] = "foreach"
     var: str = Field(pattern=r"^[a-z][a-z0-9_]{0,31}$")
-    items: tuple[Annotated[str, Field(pattern=RESOURCE_PATTERN)], ...] | None = None
+    items: tuple[ResourceValue, ...] | None = None
     collection: str | None = Field(default=None, pattern=IDENT_PATTERN)
     max_iterations: int = Field(ge=1)
     body: tuple[Node, ...] = ()

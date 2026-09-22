@@ -119,3 +119,32 @@ def test_plan_hash_is_canonical() -> None:
     first = plan("goal", call("snapshot_dir", path="/a"))
     second = Plan.model_validate_json(first.model_dump_json())
     assert plan_sha256(first) == plan_sha256(second)
+
+
+@pytest.mark.parametrize("value", ["..", ".", "../etc", "/srv/../etc", "/srv/./logs", "/srv/.."])
+def test_dot_segments_are_not_valid_resources(value: str) -> None:
+    """``/srv/../etc`` and ``/etc`` would be different resources to the checker, one to a disk."""
+    from plan_model_checker.ir import is_valid_resource
+
+    assert not is_valid_resource(value)
+    with pytest.raises(ValidationError):
+        plan("x", call("archive_dir", path=value))
+    with pytest.raises(ValidationError):
+        plan("x", each("d", [value], [call("archive_dir", path="$d")]))
+    with pytest.raises(ValidationError):
+        plan("x", if_prop("approved", value, []))
+
+
+@pytest.mark.parametrize("value", ["/srv/app..v2", "/srv/.hidden", "a.b", "svc:a", "job-1"])
+def test_dots_inside_segment_names_are_fine(value: str) -> None:
+    from plan_model_checker.ir import is_valid_resource
+
+    assert is_valid_resource(value)
+    plan("x", call("archive_dir", path=value))
+
+
+@pytest.mark.parametrize("value", ["", "has space", "a;b", "$d", "x#1", "a" * 129])
+def test_malformed_resources_are_invalid(value: str) -> None:
+    from plan_model_checker.ir import is_valid_resource
+
+    assert not is_valid_resource(value)
