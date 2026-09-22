@@ -1,0 +1,6 @@
+{
+  "corpus_accuracy": {"min": 1.0},
+  "check_p95_ms": {"max": 50.0},
+  "repair_success_rate": {"min": 1.0},
+  "divergence_block_rate": {"min": 1.0}
+}

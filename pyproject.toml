@@ -81,7 +81,7 @@ quote-style = "double"
 [tool.mypy]
 strict = true
 python_version = "3.12"
-files = ["src", "tests", "scripts", "tasks.py"]
+files = ["src", "tests", "scripts", "bench", "tasks.py"]
 plugins = ["pydantic.mypy"]
 warn_unreachable = true
 
