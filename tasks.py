@@ -66,6 +66,7 @@ def bench() -> None:
     _run(PY, "bench/bench_baseline.py", "--check")
     _run(PY, "bench/bench_checker.py", "--check")
     _run(PY, "bench/bench_differential.py", "--check")
+    _run(PY, "bench/bench_service.py", "--check")
 
 
 def demo() -> None:
