@@ -13,6 +13,11 @@ one tool does not do what its declaration says (a snapshot that silently does no
 immediately overwritten, a lock that is not taken or whose lease expires, a status check or a
 drain that has no effect, a release that keeps the lock). Each scenario names the step that must
 be blocked and the spec that must block it.
+
+**Hard repair cases (24).** Violating plans whose fix is more than inserting the one step they
+omit: several omissions, wrong order, wrong arguments, omissions inside loops and branches, and
+plans that need a step moved under an approval guard, which no insertion achieves. They measure
+where the scripted, insert-one-step repairer stops working.
 """
 
 from __future__ import annotations
@@ -26,8 +31,10 @@ from plan_model_checker.ir import Plan
 __all__ = [
     "CorpusCase",
     "DivergenceScenario",
+    "HardCase",
     "build_corpus",
     "build_divergence_scenarios",
+    "build_hard_corpus",
     "call",
     "each",
     "each_of",
@@ -739,3 +746,378 @@ def build_divergence_scenarios() -> list[DivergenceScenario]:
             )
         )
     return scenarios
+
+
+@dataclass(frozen=True, slots=True)
+class HardCase:
+    """A violating plan whose fix is harder than inserting the one step it omits."""
+
+    name: str
+    category: str
+    plan: Plan
+    violated: frozenset[str]
+
+
+def _approve_then(path: str, body: list[Step]) -> list[Step]:
+    return [call("request_approval", path=path), if_prop("approved", path, body)]
+
+
+def _multi_omission() -> list[HardCase]:
+    return [
+        HardCase(
+            "delete_without_archive_or_snapshot",
+            "multi_omission",
+            plan("Delete /m1.", *_approve_then("/m1", [call("delete_dir", path="/m1")])),
+            frozenset({"backup_before_delete", "archive_before_delete"}),
+        ),
+        HardCase(
+            "compact_without_lock_or_release",
+            "multi_omission",
+            plan("Compact /m2.", call("compact_dir", path="/m2")),
+            frozenset({"mutate_under_lock"}),
+        ),
+        HardCase(
+            "restart_without_drain_or_undrain",
+            "multi_omission",
+            plan("Restart svc:m3.", call("restart_service", service="svc:m3")),
+            frozenset({"drain_before_restart"}),
+        ),
+        HardCase(
+            "retry_and_restart_with_three_omissions",
+            "multi_omission",
+            plan(
+                "Retry job-m4 and restart svc:m4.",
+                call("submit_job", job="job-m4"),
+                call("retry_job", job="job-m4"),
+                call("restart_service", service="svc:m4"),
+            ),
+            frozenset({"status_before_retry", "drain_before_restart"}),
+        ),
+        HardCase(
+            "delete_and_compact_with_four_omissions",
+            "multi_omission",
+            plan(
+                "Delete /m5 and compact /m6.",
+                *_approve_then("/m5", [call("delete_dir", path="/m5")]),
+                call("compact_dir", path="/m6"),
+            ),
+            frozenset({"backup_before_delete", "archive_before_delete", "mutate_under_lock"}),
+        ),
+    ]
+
+
+def _wrong_order() -> list[HardCase]:
+    return [
+        HardCase(
+            "snapshot_after_delete",
+            "wrong_order",
+            plan(
+                "Delete /o1.",
+                *_approve_then(
+                    "/o1",
+                    [
+                        call("archive_dir", path="/o1"),
+                        call("delete_dir", path="/o1"),
+                        call("snapshot_dir", path="/o1"),
+                    ],
+                ),
+            ),
+            frozenset({"backup_before_delete"}),
+        ),
+        HardCase(
+            "release_before_compact",
+            "wrong_order",
+            plan(
+                "Compact /o2.",
+                call("acquire_lock", path="/o2"),
+                call("release_lock", path="/o2"),
+                call("compact_dir", path="/o2"),
+            ),
+            frozenset({"mutate_under_lock"}),
+        ),
+        HardCase(
+            "archive_after_delete",
+            "wrong_order",
+            plan(
+                "Delete /o3.",
+                *_approve_then(
+                    "/o3",
+                    [
+                        call("snapshot_dir", path="/o3"),
+                        call("delete_dir", path="/o3"),
+                        call("archive_dir", path="/o3"),
+                    ],
+                ),
+            ),
+            frozenset({"archive_before_delete"}),
+        ),
+        HardCase(
+            "check_after_retry",
+            "wrong_order",
+            plan(
+                "Retry job-o4.",
+                call("submit_job", job="job-o4"),
+                call("retry_job", job="job-o4"),
+                call("check_status", job="job-o4"),
+            ),
+            frozenset({"status_before_retry"}),
+        ),
+    ]
+
+
+def _wrong_args() -> list[HardCase]:
+    return [
+        HardCase(
+            "snapshot_of_another_directory",
+            "wrong_args",
+            plan(
+                "Delete /w1.",
+                *_approve_then(
+                    "/w1",
+                    [
+                        call("archive_dir", path="/w1"),
+                        call("snapshot_dir", path="/w2"),
+                        call("delete_dir", path="/w1"),
+                    ],
+                ),
+            ),
+            frozenset({"backup_before_delete"}),
+        ),
+        HardCase(
+            "lock_on_another_path",
+            "wrong_args",
+            plan(
+                "Compact /w4.",
+                call("acquire_lock", path="/w3"),
+                call("compact_dir", path="/w4"),
+                call("release_lock", path="/w3"),
+            ),
+            frozenset({"mutate_under_lock"}),
+        ),
+        HardCase(
+            "drain_of_another_service",
+            "wrong_args",
+            plan(
+                "Restart svc:w6.",
+                call("drain_service", service="svc:w5"),
+                call("restart_service", service="svc:w6"),
+                call("undrain_service", service="svc:w5"),
+            ),
+            frozenset({"drain_before_restart"}),
+        ),
+        HardCase(
+            "status_of_another_job",
+            "wrong_args",
+            plan(
+                "Retry job-w7.",
+                call("submit_job", job="job-w7"),
+                call("check_status", job="job-w8"),
+                call("retry_job", job="job-w7"),
+            ),
+            frozenset({"status_before_retry"}),
+        ),
+    ]
+
+
+def _in_loops_and_branches() -> list[HardCase]:
+    return [
+        HardCase(
+            "snapshot_missing_in_collection_loop",
+            "in_loop",
+            plan(
+                "Delete every stale directory.",
+                each_of(
+                    "d",
+                    "stale",
+                    3,
+                    _approve_then(
+                        "$d", [call("archive_dir", path="$d"), call("delete_dir", path="$d")]
+                    ),
+                ),
+            ),
+            frozenset({"backup_before_delete"}),
+        ),
+        HardCase(
+            "release_missing_in_fixed_loop",
+            "in_loop",
+            plan(
+                "Compact two shards.",
+                each(
+                    "d",
+                    ["/l1", "/l2"],
+                    [call("acquire_lock", path="$d"), call("compact_dir", path="$d")],
+                ),
+            ),
+            frozenset({"release_all_locks"}),
+        ),
+        HardCase(
+            "undrain_missing_in_collection_loop",
+            "in_loop",
+            plan(
+                "Restart every service.",
+                each_of(
+                    "s",
+                    "services",
+                    2,
+                    [
+                        call("drain_service", service="$s"),
+                        call("restart_service", service="$s"),
+                    ],
+                ),
+            ),
+            frozenset({"undrain_at_end"}),
+        ),
+        HardCase(
+            "shared_lock_taken_every_iteration",
+            "in_loop",
+            plan(
+                "Archive two directories under one lock.",
+                each(
+                    "i",
+                    ["/x1", "/x2"],
+                    [
+                        call("acquire_lock", path="/lk"),
+                        call("compact_dir", path="/lk"),
+                        call("archive_dir", path="$i"),
+                    ],
+                ),
+            ),
+            frozenset({"no_double_acquire", "release_all_locks"}),
+        ),
+        HardCase(
+            "release_missing_on_one_branch",
+            "in_branch",
+            plan(
+                "Compact /b1 if it is big.",
+                if_opaque(
+                    "big",
+                    [
+                        call("acquire_lock", path="/b1"),
+                        call("compact_dir", path="/b1"),
+                        call("release_lock", path="/b1"),
+                    ],
+                    [call("acquire_lock", path="/b1"), call("compact_dir", path="/b1")],
+                ),
+            ),
+            frozenset({"release_all_locks"}),
+        ),
+        HardCase(
+            "check_missing_on_one_branch",
+            "in_branch",
+            plan(
+                "Retry job-b2 now or later.",
+                call("submit_job", job="job-b2"),
+                if_opaque(
+                    "now",
+                    [call("retry_job", job="job-b2")],
+                    [call("check_status", job="job-b2"), call("retry_job", job="job-b2")],
+                ),
+            ),
+            frozenset({"status_before_retry"}),
+        ),
+        HardCase(
+            "snapshot_missing_in_nested_branch",
+            "in_branch",
+            plan(
+                "Delete /b3.",
+                *_approve_then(
+                    "/b3",
+                    [
+                        call("archive_dir", path="/b3"),
+                        if_opaque(
+                            "fast",
+                            [call("delete_dir", path="/b3")],
+                            [call("snapshot_dir", path="/b3"), call("delete_dir", path="/b3")],
+                        ),
+                    ],
+                ),
+            ),
+            frozenset({"backup_before_delete"}),
+        ),
+        HardCase(
+            "undrain_missing_in_branch",
+            "in_branch",
+            plan(
+                "Restart svc:b4 during maintenance.",
+                if_opaque(
+                    "maintenance",
+                    [
+                        call("drain_service", service="svc:b4"),
+                        call("restart_service", service="svc:b4"),
+                    ],
+                ),
+            ),
+            frozenset({"undrain_at_end"}),
+        ),
+    ]
+
+
+def _needs_restructure() -> list[HardCase]:
+    return [
+        HardCase(
+            "delete_outside_the_approval_guard",
+            "needs_restructure",
+            plan(
+                "Delete /r1.",
+                call("request_approval", path="/r1"),
+                call("archive_dir", path="/r1"),
+                call("snapshot_dir", path="/r1"),
+                call("delete_dir", path="/r1"),
+            ),
+            frozenset({"approval_delete_dir"}),
+        ),
+        HardCase(
+            "loop_deletes_without_approval_guard",
+            "needs_restructure",
+            plan(
+                "Delete every stale directory.",
+                each_of(
+                    "d",
+                    "stale",
+                    2,
+                    [
+                        call("request_approval", path="$d"),
+                        call("archive_dir", path="$d"),
+                        call("snapshot_dir", path="$d"),
+                        call("delete_dir", path="$d"),
+                    ],
+                ),
+            ),
+            frozenset({"approval_delete_dir"}),
+        ),
+        HardCase(
+            "second_delete_reuses_a_consumed_approval",
+            "needs_restructure",
+            plan(
+                "Delete /r2 twice.",
+                *_approve_then(
+                    "/r2",
+                    [
+                        call("archive_dir", path="/r2"),
+                        call("snapshot_dir", path="/r2"),
+                        call("delete_dir", path="/r2"),
+                        call("delete_dir", path="/r2"),
+                    ],
+                ),
+            ),
+            frozenset({"approval_delete_dir"}),
+        ),
+    ]
+
+
+def build_hard_corpus() -> list[HardCase]:
+    """24 violating plans for the repair loop, harder than one omitted step.
+
+    Several omissions in one plan, steps in the wrong order, steps on the wrong resource, steps
+    missing inside loops and branches, and plans that no insertion can fix because the unsafe
+    step has to move under an approval guard. ``violated`` is the set of specs the plan is built
+    to break; the checker must report at least those. What the scripted repairer makes of each
+    case is measured by bench/bench_checker.py, not assumed here.
+    """
+    return [
+        *_multi_omission(),
+        *_wrong_order(),
+        *_wrong_args(),
+        *_in_loops_and_branches(),
+        *_needs_restructure(),
+    ]

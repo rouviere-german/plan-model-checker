@@ -8,10 +8,16 @@ from plan_model_checker.agentic.approval import ApprovalRecord, ApprovalStore
 from plan_model_checker.agentic.budget import BudgetLedger, BudgetLimits
 from plan_model_checker.agentic.providers.fake import FakeProvider
 from plan_model_checker.checker import ModelChecker
-from plan_model_checker.corpus import CorpusCase, build_corpus, build_divergence_scenarios
+from plan_model_checker.corpus import (
+    CorpusCase,
+    HardCase,
+    build_corpus,
+    build_divergence_scenarios,
+    build_hard_corpus,
+)
 from plan_model_checker.effects import EffectRegistry
 from plan_model_checker.oracle import oracle_check, replay_counterexample, violates
-from plan_model_checker.planner import RepairLoop, ScriptedRepairPolicy
+from plan_model_checker.planner import RepairLoop, ScriptedRepairPolicy, missing_calls
 from plan_model_checker.runtime import PlanExecutor, RunResult, ToolGateway
 from plan_model_checker.spec.specs import SpecSet
 from plan_model_checker.world import FileMaintenanceWorld, build_tools
@@ -137,3 +143,52 @@ def test_a_tool_that_lies_about_the_fault_is_stopped_no_later(
     else:
         assert lying.status == "aborted"
         assert lying.misreports, "the sensor contradicts the tool's report"
+
+
+HARD = build_hard_corpus()
+
+
+def test_hard_corpus_shape() -> None:
+    assert len(HARD) == 24
+    assert len({case.name for case in HARD}) == 24
+    assert {case.category for case in HARD} == {
+        "multi_omission",
+        "wrong_order",
+        "wrong_args",
+        "in_loop",
+        "in_branch",
+        "needs_restructure",
+    }
+
+
+@pytest.mark.parametrize("case", HARD, ids=[case.name for case in HARD])
+def test_hard_cases_violate_what_they_were_built_to_violate(
+    case: HardCase, checker: ModelChecker, registry: EffectRegistry, specs: SpecSet
+) -> None:
+    result = checker.check(case.plan)
+    assert not result.ok
+    assert case.violated <= set(result.violated_specs())
+    oracle = oracle_check(case.plan, registry, specs)
+    assert set(result.violated_specs()) == {name for name, bad in oracle.violated.items() if bad}
+
+
+def test_scripted_repairs_of_hard_cases_verify_keep_every_step_or_need_an_override(
+    checker: ModelChecker,
+) -> None:
+    statuses: dict[str, list[str]] = {}
+    for case in HARD:
+        loop = RepairLoop(
+            checker,
+            FakeProvider(ScriptedRepairPolicy()),
+            BudgetLedger(BudgetLimits.of(steps=10, tokens=10_000_000, usd=1.0)),
+        )
+        outcome = loop.run(case.plan.goal, case.plan)
+        statuses.setdefault(case.category, []).append(outcome.status)
+        assert outcome.status in {"verified", "needs_override"}
+        assert missing_calls(case.plan, outcome.plan) == []
+        if outcome.status == "verified":
+            assert checker.check(outcome.plan).ok
+    # Moving a delete under an approval guard is not an insertion: the scripted repairer
+    # cannot do it, and the loop hands these plans to a human.
+    assert statuses["needs_restructure"] == ["needs_override"] * 3
+    assert "verified" in statuses["multi_omission"]
