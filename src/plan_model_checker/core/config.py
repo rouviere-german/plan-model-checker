@@ -91,6 +91,9 @@ class Settings(BaseSettings):
     plan_max_nodes: int = Field(default=200, ge=1, le=2_000)
     plan_max_depth: int = Field(default=8, ge=1, le=32)
     plan_max_loop_bound: int = Field(default=8, ge=1, le=64)
+    # /v1/monitor: spec instances (6 per path in the built-in specs) and monitor steps per request.
+    monitor_max_instances: int = Field(default=2_000, ge=1, le=100_000)
+    monitor_max_work: int = Field(default=200_000, ge=1)
 
     # --- storage ---
     data_dir: Path = Path("var")

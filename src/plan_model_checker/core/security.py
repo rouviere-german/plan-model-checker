@@ -41,7 +41,7 @@ __all__ = [
 
 API_KEY_HEADER = "X-API-Key"
 _MAX_KEY_LENGTH = 512
-SCOPES = frozenset({"check", "monitor", "repair", "override", "approve"})
+SCOPES = frozenset({"check", "monitor", "repair", "override", "approve", "audit"})
 DEFAULT_SCOPES = frozenset({"check", "monitor"})
 
 

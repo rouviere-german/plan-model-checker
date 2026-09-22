@@ -29,8 +29,14 @@ KEYS = {
     "checker": "key-checker-" + "c" * 20,
     "agent": "key-agent-" + "a" * 20,
     "lead": "key-lead-" + "l" * 20,
+    "auditor": "key-auditor-" + "u" * 20,
 }
-SCOPES = {"checker": "check", "agent": "check+monitor+repair+override", "lead": "approve"}
+SCOPES = {
+    "checker": "check",
+    "agent": "check+monitor+repair+override",
+    "lead": "approve",
+    "auditor": "audit",
+}
 PATH = "/srv/logs/2025"
 
 
@@ -336,3 +342,113 @@ def test_audit_entries_redact_pii_in_plans(tmp_path: Path) -> None:
     assert "jane.doe@example.com" not in text
     for line in text.splitlines():
         json.loads(line)
+
+
+def _archive_steps(count: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "tool": "archive_dir",
+            "args": [{"name": "path", "value": f"/p/{index}"}],
+            "effects": [{"prop": "archived", "args": [f"/p/{index}"], "value": True}],
+        }
+        for index in range(count)
+    ]
+
+
+def test_monitor_refuses_effects_the_tool_does_not_declare(client: TestClient) -> None:
+    """A snapshot tool cannot also report a human approval for the path it backed up."""
+    observed = [
+        {
+            "tool": "snapshot_dir",
+            "args": [{"name": "path", "value": PATH}],
+            "effects": [
+                {"prop": "backup_ok", "args": [PATH], "value": True},
+                {"prop": "approved", "args": [PATH], "value": True},
+            ],
+        },
+        {"tool": "archive_dir", "args": [{"name": "path", "value": PATH}], "effects": []},
+    ]
+    proposed = {"tool": "delete_dir", "args": [{"name": "path", "value": PATH}]}
+    response = client.post(
+        "/v1/monitor", json={"observed": observed, "proposed": proposed}, headers=headers("agent")
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "undeclared_effect"
+
+
+def test_monitor_requests_are_budgeted_and_never_a_500(tmp_path: Path) -> None:
+    with TestClient(create_service_app(settings(tmp_path))) as client:
+        within = client.post(
+            "/v1/monitor", json={"observed": _archive_steps(300)}, headers=headers("agent")
+        )
+        # 500 distinct paths need 3,000 spec instances: over the default budget of 2,000.
+        over = client.post(
+            "/v1/monitor", json={"observed": _archive_steps(500)}, headers=headers("agent")
+        )
+    assert within.status_code == 200
+    assert over.status_code == 422
+    assert over.json()["error"]["code"] == "monitor_budget_exceeded"
+    small = create_service_app(settings(tmp_path / "small", monitor_max_work=50))
+    with TestClient(small) as client:
+        busy = client.post(
+            "/v1/monitor", json={"observed": _archive_steps(40)}, headers=headers("agent")
+        )
+    assert busy.status_code == 422
+    assert busy.json()["error"]["code"] == "monitor_budget_exceeded"
+
+
+def test_override_requests_report_check_budget_exhaustion_as_422(tmp_path: Path) -> None:
+    app = create_service_app(settings(tmp_path, check_max_states=100))
+    big = plan("big", *[call("request_approval", path=f"/d{i}") for i in range(8)])
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/overrides",
+            json={
+                "plan": big.model_dump(mode="json"),
+                "justification": "a long enough justification for the test",
+            },
+            headers=headers("agent"),
+        )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "check_budget_exceeded"
+
+
+def test_monitor_decisions_are_audited_and_the_head_can_be_anchored(
+    client: TestClient, tmp_path: Path
+) -> None:
+    observed = [
+        {
+            "tool": "request_approval",
+            "args": [{"name": "path", "value": PATH}],
+            "effects": [{"prop": "approved", "args": [PATH], "value": True}],
+        },
+    ]
+    proposed = {"tool": "delete_dir", "args": [{"name": "path", "value": PATH}]}
+    response = client.post(
+        "/v1/monitor", json={"observed": observed, "proposed": proposed}, headers=headers("agent")
+    )
+    assert response.json()["allowed"] is False
+    path = tmp_path / "audit.jsonl"
+    entries = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    (decision,) = [entry for entry in entries if entry["action"] == "monitor.checked"]
+    assert decision["data"]["allowed"] is False
+    assert decision["data"]["proposed"] == f"delete_dir(path={PATH})"
+    assert decision["data"]["observed_steps"] == 1
+    assert f"backup_before_delete[r={PATH}]" in decision["data"]["violations"]
+    head = client.get("/v1/audit/head", headers=headers("auditor"))
+    assert head.status_code == 200
+    verified = verify_file(path)
+    assert head.json() == {"head": verified.head, "entries": verified.entries}
+    assert client.get("/v1/audit/head", headers=headers("agent")).status_code == 403
+
+
+def test_the_audit_head_is_only_published_for_a_verified_chain(
+    client: TestClient, tmp_path: Path
+) -> None:
+    client.post("/v1/check", json={"plan": unsafe()}, headers=headers("checker"))
+    path = tmp_path / "audit.jsonl"
+    edited = path.read_bytes().replace(b"plan.checked", b"plan.checkex", 1)
+    path.write_bytes(edited)
+    response = client.get("/v1/audit/head", headers=headers("auditor"))
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "audit_integrity"
