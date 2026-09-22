@@ -237,3 +237,32 @@ def test_synthetic_registry_supports_every_generated_spec() -> None:
     rng = random.Random(3)
     for _ in range(50):
         build_spec("s", random_spec(rng), registry)
+
+
+_MULTI = """\
+spec single: G(delete[r] -> O archive[r]);
+spec pair: G(delete[r] -> O archive[q]);
+spec triple: G(restart[s] -> (O drain[s] | O check[j] | O archive[r]));
+spec ground: G(end -> !lock_held["/fixed"]);
+"""
+_POOL = {"path": ["/a", "/b", "/c", "/d"], "service": ["svc:a", "svc:b"], "job": ["j1", "j2"]}
+
+
+@given(data=st.data())
+def test_new_instances_are_exactly_the_bindings_that_use_an_added_resource(
+    registry: EffectRegistry, data: st.DataObject
+) -> None:
+    from plan_model_checker.spec.specs import SpecSet
+
+    specs = SpecSet.parse(_MULTI, registry, include_implicit=False)
+    old = {sort: set(data.draw(st.sets(st.sampled_from(pool)))) for sort, pool in _POOL.items()}
+    added = {
+        sort: set(data.draw(st.sets(st.sampled_from(pool)))) - old[sort]
+        for sort, pool in _POOL.items()
+    }
+    universe = {sort: old[sort] | added[sort] for sort in _POOL}
+    before = {i.key for i in specs.instances({k: sorted(v) for k, v in old.items()})}
+    after = {i.key for i in specs.instances({k: sorted(v) for k, v in universe.items()})}
+    fresh = [i.key for i in specs.new_instances(universe, added)]
+    assert len(fresh) == len(set(fresh)), "each new binding is produced once"
+    assert set(fresh) == after - before

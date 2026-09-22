@@ -298,6 +298,12 @@ class EffectRegistry:
             for outcome in tool.outcomes
         )
 
+    def declared_updates(self, tool_name: str, args: Mapping[str, str]) -> frozenset[GroundProp]:
+        """Every fluent some declared outcome of this call may set: all it may report changing."""
+        return frozenset(
+            prop for outcome in self.ground_outcomes(tool_name, args) for prop, _ in outcome.updates
+        )
+
     def ground_approval(self, tool_name: str, args: Mapping[str, str]) -> GroundProp | None:
         approval = self.tool(tool_name).approval
         if approval is None:

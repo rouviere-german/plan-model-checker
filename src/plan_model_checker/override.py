@@ -10,14 +10,17 @@ written justification; all three are hashed into one approval record in the temp
 - it cannot be moved to another plan, widened to other specs, or re-justified after approval,
   because any change alters the hash.
 
-A consumed override yields the set of waived instance keys. The runtime monitor still evaluates
-those instances and records each violation as *waived* in the audit log; every other spec keeps
-blocking.
+A consumed override yields an :class:`OverrideGrant`: the plan hash and the waived instance keys.
+Only :class:`~plan_model_checker.runtime.PlanExecutor` consumes overrides, and it re-checks that
+the grant belongs to the plan it is about to run and covers every violation the checker finds.
+The runtime monitor still evaluates the waived instances and records each violation as *waived*
+in the audit log; every other spec keeps blocking.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
@@ -29,7 +32,7 @@ from plan_model_checker.agentic.tools import Capability, ToolDefinition, ToolReg
 from plan_model_checker.checker import CheckResult
 from plan_model_checker.ir import Plan, plan_sha256
 
-__all__ = ["OVERRIDE_TOOL", "OverrideArgs", "OverrideError", "OverrideGate"]
+__all__ = ["OVERRIDE_TOOL", "OverrideArgs", "OverrideError", "OverrideGate", "OverrideGrant"]
 
 OVERRIDE_TOOL = "override_counterexample"
 MIN_JUSTIFICATION = 20
@@ -37,6 +40,15 @@ MIN_JUSTIFICATION = 20
 
 class OverrideError(Exception):
     """The override request or its use is invalid."""
+
+
+@dataclass(frozen=True, slots=True)
+class OverrideGrant:
+    """A consumed override: which plan it was granted for and which instances it waives."""
+
+    request_id: str
+    plan_sha256: str
+    waived: frozenset[str]
 
 
 class OverrideArgs(BaseModel):
@@ -133,8 +145,8 @@ class OverrideGate:
         )
         return record
 
-    def consume(self, plan: Plan, request_id: str, *, principal: str) -> frozenset[str]:
-        """Use up an approved override for exactly this plan; return the waived instances."""
+    def consume(self, plan: Plan, request_id: str, *, principal: str) -> OverrideGrant:
+        """Use up an approved override for exactly this plan; return what it waives."""
         try:
             record = self._store.get(request_id)
         except ApprovalError as exc:
@@ -159,4 +171,6 @@ class OverrideGate:
                 "waived": [*args.waived],
             },
         )
-        return frozenset(args.waived)
+        return OverrideGrant(
+            request_id=request_id, plan_sha256=args.plan_sha256, waived=frozenset(args.waived)
+        )

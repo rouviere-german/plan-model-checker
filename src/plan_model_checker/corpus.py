@@ -590,6 +590,11 @@ class DivergenceScenario:
     collections: dict[str, list[str]] = field(default_factory=dict)
     opaque: dict[str, bool] = field(default_factory=dict)
 
+    @property
+    def faulted_tools(self) -> frozenset[str]:
+        """The tools the faults apply to (fault keys are ``tool`` or ``tool:resource``)."""
+        return frozenset(key.partition(":")[0] for key in self.faults)
+
 
 def _delete_plan(paths: list[str], *, write_first: bool = False) -> Plan:
     steps: list[Step] = []

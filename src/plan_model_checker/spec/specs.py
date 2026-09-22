@@ -18,7 +18,7 @@ is silently always true.
 from __future__ import annotations
 
 import itertools
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -269,11 +269,50 @@ class SpecSet:
             for values in itertools.product(*domains):
                 if len(result) >= max_instances:
                     raise InstanceBudgetExceededError(max_instances)
-                binding = tuple(zip(names, values, strict=True))
-                source = substitute(spec.formula, dict(binding))
-                result.append(
-                    SpecInstance(
-                        spec=spec.name, binding=binding, source=source, final=final_form(source)
-                    )
-                )
+                result.append(_instance(spec, tuple(zip(names, values, strict=True))))
         return result
+
+    def new_instances(
+        self,
+        universe: Mapping[str, Collection[str]],
+        added: Mapping[str, Iterable[str]],
+        *,
+        max_instances: int = 10_000,
+    ) -> list[SpecInstance]:
+        """The instances over ``universe`` whose binding uses at least one ``added`` resource.
+
+        ``universe`` already includes ``added``. Each such binding is produced exactly once: it
+        is enumerated at the first variable that takes a new value (earlier variables range over
+        the old resources only). This lets the runtime monitor grow its active domain one call at
+        a time at a cost proportional to the new instances, instead of re-enumerating all of
+        them for every new resource.
+        """
+        result: list[SpecInstance] = []
+        fresh_by_sort = {sort: sorted(set(values)) for sort, values in added.items()}
+        for spec in self.specs:
+            names = [var for var, _ in spec.var_sorts]
+            sorts = [sort for _, sort in spec.var_sorts]
+            new = [fresh_by_sort.get(sort, []) for sort in sorts]
+            if not any(new):
+                continue
+            # Only specs with several variables need the old and full domains (sorting them is
+            # what would make every registration cost as much as the whole universe).
+            full = [sorted(universe.get(sort, ())) if len(sorts) > 1 else [] for sort in sorts]
+            old = [
+                [value for value in domain if value not in set(fresh)]
+                for domain, fresh in zip(full, new, strict=True)
+            ]
+            for first, fresh in enumerate(new):
+                if not fresh:
+                    continue
+                domains = [*old[:first], fresh, *full[first + 1 :]]
+                for values in itertools.product(*domains):
+                    if len(result) >= max_instances:
+                        raise InstanceBudgetExceededError(max_instances)
+                    result.append(_instance(spec, tuple(zip(names, values, strict=True))))
+        return result
+
+
+def _instance(spec: Spec, binding: tuple[tuple[str, str], ...]) -> SpecInstance:
+    source = substitute(spec.formula, dict(binding))
+    return SpecInstance(spec=spec.name, binding=binding, source=source, final=final_form(source))

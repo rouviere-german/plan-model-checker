@@ -12,7 +12,7 @@ from plan_model_checker.corpus import CorpusCase, build_corpus, build_divergence
 from plan_model_checker.effects import EffectRegistry
 from plan_model_checker.oracle import oracle_check, replay_counterexample, violates
 from plan_model_checker.planner import RepairLoop, ScriptedRepairPolicy
-from plan_model_checker.runtime import PlanExecutor, ToolGateway
+from plan_model_checker.runtime import PlanExecutor, RunResult, ToolGateway
 from plan_model_checker.spec.specs import SpecSet
 from plan_model_checker.world import FileMaintenanceWorld, build_tools
 
@@ -94,3 +94,46 @@ def test_every_divergence_is_blocked_before_the_violating_step_runs(
     assert result.divergences, "the fault shows up as a divergence from the declaration"
     # The blocked call would have been the next position: it never ran.
     assert result.blocked.position == len(result.executed) + 1
+
+
+@pytest.mark.parametrize("scenario", SCENARIOS, ids=[s.name for s in SCENARIOS])
+def test_a_tool_that_lies_about_the_fault_is_stopped_no_later(
+    scenario: object, registry: EffectRegistry, specs: SpecSet
+) -> None:
+    """The same faults, but the faulty tool reports its declared (successful) effects."""
+    from plan_model_checker.corpus import DivergenceScenario
+
+    assert isinstance(scenario, DivergenceScenario)
+
+    def run(*, lying: bool) -> tuple[RunResult, FileMaintenanceWorld]:
+        world = FileMaintenanceWorld(
+            dirs=dict(scenario.dirs),
+            faults=dict(scenario.faults),
+            collections={k: list(v) for k, v in scenario.collections.items()},
+            opaque=dict(scenario.opaque),
+            reviewer=_approve,
+        )
+        misreporting = scenario.faulted_tools if lying else frozenset()
+        tools = build_tools(world, registry, misreporting=misreporting)
+        result = PlanExecutor(
+            registry,
+            specs,
+            ToolGateway(registry, tools),
+            opaque=world.decide,
+            collections=world.collection,
+            sensor=world.sense,
+        ).run(scenario.plan)
+        return result, world
+
+    honest, honest_world = run(lying=False)
+    lying, world = run(lying=True)
+    assert len(lying.executed) <= len(honest.executed), "the violating step never runs"
+    assert world.deleted <= honest_world.deleted, "nothing is deleted that the honest run kept"
+    if scenario.name.startswith("lock_lease_expires"):
+        # compact_dir does not declare lock_held, so it has nothing to lie about; the sensor
+        # still sees the lost lease and the next compaction is blocked.
+        assert lying.status == "blocked"
+        assert lying.misreports == []
+    else:
+        assert lying.status == "aborted"
+        assert lying.misreports, "the sensor contradicts the tool's report"

@@ -46,7 +46,8 @@ def executor(
     world: FileMaintenanceWorld,
     *,
     audit: AuditLog | None = None,
-    waived: frozenset[str] = frozenset(),
+    overrides: OverrideGate | None = None,
+    principal: str = "agent:executor",
     sensor: bool = True,
 ) -> PlanExecutor:
     return PlanExecutor(
@@ -56,7 +57,8 @@ def executor(
         opaque=world.decide,
         collections=world.collection,
         audit=audit,
-        waived=waived,
+        principal=principal,
+        overrides=overrides,
         sensor=world.sense if sensor else None,
     )
 
@@ -179,6 +181,12 @@ def test_world_tools_refuse_a_registry_that_changed_their_declaration(
         ToolGateway(registry, build_tools(world, registry, pins=pins))
 
 
+def test_build_tools_skips_pins_without_an_implementation(registry: EffectRegistry) -> None:
+    pins = {"archive_dir": registry.tool_sha256("archive_dir"), "rm_rf": "0" * 64}
+    tools = build_tools(FileMaintenanceWorld(), registry, pins=pins)
+    assert [tool.name for tool in tools] == ["archive_dir"]
+
+
 # --- executor -----------------------------------------------------------------------------------
 
 
@@ -279,10 +287,25 @@ def test_tool_failures_and_undeclared_calls_abort_the_run(
     failed = executor(registry, specs, world).run(plan("x", call("write_file", path=PATH)))
     assert failed.status == "aborted"
     assert "failed" in failed.reason
+    # Calls the registry does not declare never reach the gateway: the plan does not verify.
     unknown = executor(registry, specs, world).run(plan("x", call("rm_rf", path=PATH)))
-    assert unknown.status == "aborted"
+    assert unknown.status == "refused"
+    assert unknown.executed == []
     bad_args = executor(registry, specs, world).run(plan("x", call("write_file", target=PATH)))
-    assert bad_args.status == "aborted"
+    assert bad_args.status == "refused"
+    # A declared tool without a pinned implementation stops the run when it is reached.
+    tools = [tool for tool in build_tools(world, registry) if tool.name != "write_file"]
+    partial = PlanExecutor(
+        registry,
+        specs,
+        ToolGateway(registry, tools),
+        opaque=world.decide,
+        collections=world.collection,
+    )
+    missing = partial.run(plan("x", call("archive_dir", path="/a"), call("write_file", path="/b")))
+    assert missing.status == "aborted"
+    assert "no pinned implementation" in missing.reason
+    assert missing.executed == ["archive_dir(path=/a)"]
 
 
 def test_branches_and_loops_follow_the_observed_world(
@@ -338,17 +361,29 @@ def test_an_approved_override_waives_exactly_the_listed_instances_once(
         gate.consume(plan("other", call("archive_dir", path="/z")), record.id, principal="agent:a")
     with pytest.raises(OverrideError, match="not yours"):
         gate.consume(unsafe, record.id, principal="agent:b")
-    waived = gate.consume(unsafe, record.id, principal="agent:a")
-    assert waived == frozenset({"backup_before_delete[r=/data/x]"})
-    with pytest.raises(OverrideError):
-        gate.consume(unsafe, record.id, principal="agent:a")
     with pytest.raises(OverrideError, match="unknown"):
         gate.consume(unsafe, "0" * 32, principal="agent:a")
 
+    # The executor consumes the override itself, for the plan it is about to run.
     world = FileMaintenanceWorld(dirs={PATH: 1}, reviewer=approve)
-    run = executor(registry, specs, world, audit=audit, waived=waived).run(unsafe)
-    assert run.status == "completed"
-    assert [v.spec for v in run.waived] == ["backup_before_delete"]
+    run = executor(registry, specs, world, audit=audit, overrides=gate, principal="agent:a").run(
+        unsafe, override=record.id
+    )
+    assert run.status == "completed", run.reason
+    assert [v.instance for v in run.waived] == ["backup_before_delete[r=/data/x]"]
+    assert world.deleted == {PATH}
+    with pytest.raises(OverrideError):
+        gate.consume(unsafe, record.id, principal="agent:a")  # single use
+    second = gate.request(
+        unsafe,
+        result,
+        justification="the directory is a disposable cache rebuilt nightly",
+        requested_by="agent:a",
+    )
+    gate.decide(second.id, approver="human:lead", approve=True)
+    grant = gate.consume(unsafe, second.id, principal="agent:a")
+    assert grant.plan_sha256 == result.plan_sha256
+    assert grant.waived == frozenset({"backup_before_delete[r=/data/x]"})
     text = audit.path.read_text()
     for action in ("override.requested", "override.decided", "override.consumed", "monitor.waived"):
         assert action in text
